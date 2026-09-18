@@ -1,364 +1,271 @@
 #!/usr/bin/env zsh
 
 ###############################################################################
-# llmchat
+# llmchat — local Ollama chat via HTTP API
 #
-# A local-only terminal LLM chat script for zsh using Ollama.
+# Does NOT:
+#   - execute model output or run any shell commands from the model
+#   - access your filesystem beyond the optional memory file
+#   - call any remote API by default (local by default, not enforced)
 #
-# This script:
-#   - sends your text to a local Ollama model
-#   - prints the model's response
-#   - optionally keeps conversation history during the session
-#
-# This script does NOT:
-#   - execute model output
-#   - run shell commands suggested by the model
-#   - give the model access to your filesystem
-#   - call any remote API during normal use
-#
-# Requirements:
-#   - zsh
-#   - ollama
-#   - a pulled local model, for example:
-#       ollama pull llama3.1:8b-instruct
+# Requires: zsh, curl, jq, ollama
 ###############################################################################
 
 emulate -R zsh
 setopt no_nomatch
 
 PROGRAM_NAME="${0:t}"
+OLLAMA_HOST="${OLLAMA_HOST:-http://localhost:11434}"
 
-# Default model.
-# You can override this with:
-#   LLMCHAT_MODEL="qwen2.5:7b-instruct" ./llmchat
-# or:
-#   ./llmchat --model qwen2.5:7b-instruct
 MODEL="${LLMCHAT_MODEL:-llama3.1:8b}"
-
-# Keep short-term chat history by default.
 USE_HISTORY=1
-
-# Maximum number of characters to keep in the session history.
-# This prevents prompts from growing forever.
-MAX_HISTORY_CHARS=16000
-
-# Internal conversation transcript.
-CHAT_HISTORY=""
-
-SYSTEM_PROMPT="
-You are a local terminal-based language model assistant named Aeon.
-You respond with text only.
-You cannot run commands, execute programs, inspect files, modify files, access devices, or control the computer.
-If the user asks for commands, you may explain them, but you must not claim to have run them.
-Be concise unless the user asks for detail.
-Do not be overly complemantary or flowery with your responses.
-"
-
-# Persistent local context file.
-# This is read and included in every prompt if it exists.
+MAX_HISTORY_CHARS=8000
 USE_MEMORY=1
 MEMORY_FILE="${CHAT_MEMORY_FILE:-${LLMCHAT_MEMORY_FILE:-$HOME/.config/chat/memory.md}}"
+MEMORY_CONTEXT=""
+
+typeset -ga CHAT_MESSAGES
+
+SYSTEM_PROMPT="You are a local terminal assistant named Aeon.
+Reply with plain text only.
+You cannot run commands, inspect arbitrary files, modify files, or control the computer.
+You may use only the context explicitly provided in the prompt.
+If asked about shell commands, explain them but do not claim to have run them.
+Be concise unless asked for more detail.
+Do not be overly complimentary."
 
 ###############################################################################
-# Utility functions
+# Utilities
 ###############################################################################
+
+die()  { print -ru2 -- "Error: $*"; exit 1 }
+have() { command -v "$1" >/dev/null 2>&1 }
 
 usage() {
   cat <<EOF
-Usage:
-  $PROGRAM_NAME [options]
-  $PROGRAM_NAME [options] "prompt here"
+Usage: $PROGRAM_NAME [options] [prompt]
 
 Options:
-  -m, --model MODEL      Use a different Ollama model
-  --no-history          Do not keep conversation history
-  -1, --one-shot        Run one prompt and exit
-  -h, --help            Show this help message
-  --memory-file FILE    Use a different persistent context file
-  --no-memory           Disable persistent context file
+  -m, --model MODEL      Model to use              (default: $MODEL)
+  --no-history           Disable conversation history for this session
+  --memory-file FILE     Persistent context file   (default: $MEMORY_FILE)
+  --no-memory            Disable persistent context
+  -1, --one-shot         Send one prompt and exit
+  -h, --help             Show this help
 
 Interactive commands:
-  /help                 Show interactive help
-  /exit, /quit          Exit the chat
-  /clear                Clear session history
-  /model                Show current model
-  /history              Show whether history is enabled
-  /memory               Show persistent memory/context status
-  /multiline            Enter a multiline prompt; finish with a single dot '.'
-
-Examples:
-  $PROGRAM_NAME
-  $PROGRAM_NAME "Explain recursion simply."
-  $PROGRAM_NAME --model qwen2.5:7b-instruct
-  $PROGRAM_NAME --no-history
+  /help  /exit  /quit  /clear  /model  /history  /memory  /multiline
 
 Environment variables:
-  LLMCHAT_MODEL         Default model name
-  CHAT_MEMORY_FILE      Persistent context file path
+  LLMCHAT_MODEL    Default model name
+  CHAT_MEMORY_FILE Default memory file path
+  OLLAMA_HOST      Ollama API base URL  (default: http://localhost:11434)
 EOF
 }
 
-die() {
-  print -ru2 -- "Error: $*"
-  exit 1
-}
+###############################################################################
+# Startup checks
+###############################################################################
 
-have_command() {
-  command -v "$1" >/dev/null 2>&1
-}
+ensure_deps() {
+  local -a missing=()
+  have curl   || missing+=(curl)
+  have jq     || missing+=(jq)
+  have ollama || missing+=(ollama)
+  (( ${#missing} )) && die "Missing required tools: ${(j:, :)missing}"
 
-ensure_ollama_available() {
-  if ! have_command ollama; then
-    die "Ollama is not installed or not in PATH. Install it from https://ollama.com"
-  fi
-
-  if ! ollama list >/dev/null 2>&1; then
-    print -ru2 -- "Could not connect to Ollama."
-    print -ru2 -- ""
-    print -ru2 -- "Try one of these:"
-    print -ru2 -- "  - On macOS, open the Ollama app."
-    print -ru2 -- "  - On Linux, run: ollama serve"
-    print -ru2 -- ""
-    die "Ollama is installed, but the local Ollama service is not reachable."
+  if ! curl -sf "${OLLAMA_HOST}/" >/dev/null 2>&1; then
+    print -ru2 -- "Cannot reach Ollama at ${OLLAMA_HOST}."
+    print -ru2 -- "  macOS : open the Ollama app"
+    print -ru2 -- "  Linux : ollama serve"
+    die "Ollama is not running."
   fi
 }
 
-ensure_model_available() {
-  if ollama show "$MODEL" >/dev/null 2>&1; then
-    return 0
-  fi
+ensure_model() {
+  if ! curl -sf "${OLLAMA_HOST}/api/show" \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg name "$MODEL" '{name: $name}')" \
+    >/dev/null 2>&1; then
 
-  print -- "Model '$MODEL' is not currently available locally."
-  print -- ""
-  print -- "You can download it with:"
-  print -- "  ollama pull $MODEL"
-  print -- ""
-
-  printf "Pull it now? This requires an internet connection. [y/N] "
-  local answer
-  IFS= read -r answer
-
-  case "$answer" in
-    [Yy]|[Yy][Ee][Ss])
-      ollama pull "$MODEL" || die "Failed to pull model '$MODEL'."
-      ;;
-    *)
-      die "Model '$MODEL' is required. Pull it manually with: ollama pull $MODEL"
-      ;;
-  esac
-}
-
-trim_history_if_needed() {
-  if (( ${#CHAT_HISTORY} > MAX_HISTORY_CHARS )); then
-    CHAT_HISTORY=$'[earlier conversation trimmed]\n'"${CHAT_HISTORY[-$MAX_HISTORY_CHARS,-1]}"
+    print -- "Model '$MODEL' is not available locally."
+    printf "Pull it now? (needs internet) [y/N] "
+    local ans; IFS= read -r ans
+    case "$ans" in
+      [Yy]*) ollama pull "$MODEL" || die "Failed to pull '$MODEL'." ;;
+      *)     die "Run manually: ollama pull $MODEL" ;;
+    esac
   fi
 }
 
-build_prompt() {
+load_memory() {
+  MEMORY_CONTEXT=""
+  (( USE_MEMORY )) && [[ -r "$MEMORY_FILE" ]] && MEMORY_CONTEXT="$(<"$MEMORY_FILE")"
+}
+
+###############################################################################
+# History management
+###############################################################################
+
+trim_history() {
+  local joined
+
+  while (( ${#CHAT_MESSAGES[@]} > 2 )); do
+    joined="${(j::)CHAT_MESSAGES}"
+    (( ${#joined} <= MAX_HISTORY_CHARS )) && break
+    CHAT_MESSAGES=("${CHAT_MESSAGES[@]:2}")
+  done
+}
+
+###############################################################################
+# Model interaction
+###############################################################################
+
+build_payload() {
   local user_input="$1"
-  local memory_context=""
 
-  if (( USE_MEMORY )) && [[ -r "$MEMORY_FILE" ]]; then
-    memory_context="$(<"$MEMORY_FILE")"
-  fi
+  local system_content="$SYSTEM_PROMPT"
+  [[ -n "$MEMORY_CONTEXT" ]] && system_content+=$'\n\nPersistent context:\n'"$MEMORY_CONTEXT"
+
+  local -a flat=("system" "$system_content")
 
   if (( USE_HISTORY )); then
-    if [[ -n "$memory_context" ]]; then
-      cat <<EOF
-$SYSTEM_PROMPT
-
-Persistent user context:
-$memory_context
-
-Conversation so far:
-$CHAT_HISTORY
-
-User:
-$user_input
-
-Assistant:
-EOF
-    else
-      cat <<EOF
-$SYSTEM_PROMPT
-
-Conversation so far:
-$CHAT_HISTORY
-
-User:
-$user_input
-
-Assistant:
-EOF
-    fi
-  else
-    if [[ -n "$memory_context" ]]; then
-      cat <<EOF
-$SYSTEM_PROMPT
-
-Persistent user context:
-$memory_context
-
-User:
-$user_input
-
-Assistant:
-EOF
-    else
-      cat <<EOF
-$SYSTEM_PROMPT
-
-User:
-$user_input
-
-Assistant:
-EOF
-    fi
+    local i
+    for (( i = 1; i <= ${#CHAT_MESSAGES[@]}; i += 2 )); do
+      flat+=("user"      "${CHAT_MESSAGES[$i]}")
+      flat+=("assistant" "${CHAT_MESSAGES[$((i + 1))]}")
+    done
   fi
+
+  flat+=("user" "$user_input")
+
+  jq -n \
+    --arg model "$MODEL" \
+    'def to_messages:
+       . as $a |
+       [range(0; ($a | length); 2) as $i |
+        {role: $a[$i], content: $a[$i + 1]}];
+     {
+       model:      $model,
+       messages:   ($ARGS.positional | to_messages),
+       stream:     true,
+       keep_alive: "30m"
+     }' \
+    --args "${flat[@]}"
 }
 
 ask_model() {
   local user_input="$1"
-  local full_prompt
-  local response
-  local tmpfile
-  local rc
-  local -a pipe_rc
+  local response tmpfile
+  local -a ps
 
-  full_prompt="$(build_prompt "$user_input")"
+  tmpfile="$(mktemp)" || return 1
 
-  tmpfile="${TMPDIR:-/tmp}/chat-response-$$-$RANDOM.txt"
+  build_payload "$user_input" |
+    curl -sf -N \
+      -H 'Content-Type: application/json' \
+      --data-binary @- \
+      "${OLLAMA_HOST}/api/chat" |
+    jq --unbuffered -rj '.message.content // empty' |
+    tee "$tmpfile"
 
-  ollama run "$MODEL" "$full_prompt" | tee "$tmpfile"
-
-  pipe_rc=("${pipestatus[@]}")
-  rc="${pipe_rc[1]}"
-
-  if (( rc != 0 )); then
-    rm -f "$tmpfile"
-    return "$rc"
-  fi
+  ps=("${pipestatus[@]}")
 
   response="$(<"$tmpfile")"
   rm -f "$tmpfile"
 
+  printf '\n'
+
+  if (( ps[1] != 0 || ps[2] != 0 || ps[3] != 0 || ps[4] != 0 )); then
+    return 1
+  fi
+
+  if [[ -z "$response" ]]; then
+    return 1
+  fi
+
   if (( USE_HISTORY )); then
-    CHAT_HISTORY+=$'\nUser:\n'
-    CHAT_HISTORY+="$user_input"
-    CHAT_HISTORY+=$'\n\nAssistant:\n'
-    CHAT_HISTORY+="$response"
-    CHAT_HISTORY+=$'\n'
-    trim_history_if_needed
+    CHAT_MESSAGES+=("$user_input" "$response")
+    trim_history
   fi
 
   return 0
 }
 
-interactive_help() {
-  cat <<EOF
+###############################################################################
+# Interactive mode
+###############################################################################
 
-Commands:
-  /help       Show this help
-  /exit       Exit the chat
-  /quit       Exit the chat
-  /clear      Clear this session's conversation history
-  /model      Show the current model
-  /history    Show whether session history is enabled
-  /multiline  Enter multiline mode; finish with a single line containing only '.'
+cmd_help() {
+  cat <<'EOF'
 
-Notes:
-  - The model is local through Ollama.
-  - The model's text is only printed.
-  - The model cannot execute shell commands from this script.
+  /help       This message
+  /exit       Exit
+  /quit       Exit
+  /clear      Clear session history
+  /model      Show current model
+  /history    Show history status
+  /memory     Show memory file status
+  /multiline  Enter multiline input; end with '.' on its own line
 
 EOF
 }
 
-read_multiline_prompt() {
-  local line
-  local text=""
-
-  print -- "Enter multiline prompt."
-  print -- "Finish with a single line containing only a dot:"
-  print -- "."
-
+read_multiline() {
+  local line text=""
+  print -- "Multiline input — finish with '.' on its own line."
   while true; do
     printf "... "
     IFS= read -r line || break
-
-    if [[ "$line" == "." ]]; then
-      break
-    fi
-
+    [[ "$line" == "." ]] && break
     text+="$line"$'\n'
   done
-
   REPLY="$text"
 }
 
-run_interactive_chat() {
-  print -- "Type /help for commands. Type /exit to quit."
+run_chat() {
+  print -- "Aeon — /help for commands, /exit to quit."
   print -- ""
 
-  local user_input
-
+  local input
   while true; do
     printf "You> "
-    IFS= read -r user_input
+    IFS= read -r input || { print -- ""; print -- "Goodbye."; break }
 
-    if (( $? != 0 )); then
-      print -- ""
-      print -- "Goodbye."
-      break
-    fi
+    case "$input" in
+      "")          continue ;;
+      /exit|/quit) print -- "Goodbye."; break ;;
+      /help)       cmd_help; continue ;;
 
-    case "$user_input" in
-      "")
+      /clear)
+        CHAT_MESSAGES=()
+        print -- "History cleared."
         continue
         ;;
 
-      "/exit"|"/quit")
-        print -- "Goodbye."
-        break
-        ;;
-
-      "/help")
-        interactive_help
+      /model)
+        print -- "Model: $MODEL"
         continue
         ;;
 
-      "/clear")
-        CHAT_HISTORY=""
-        print -- "Session history cleared."
-        continue
-        ;;
-
-      "/model")
-        print -- "Current model: $MODEL"
-        continue
-        ;;
-
-      "/history")
+      /history)
         if (( USE_HISTORY )); then
-          print -- "History: enabled"
-          print -- "Stored characters: ${#CHAT_HISTORY}"
-          print -- "Maximum characters: $MAX_HISTORY_CHARS"
+          local pairs=$(( ${#CHAT_MESSAGES[@]} / 2 ))
+          local joined="${(j::)CHAT_MESSAGES}"
+          print -- "History: enabled — $pairs exchanges, ${#joined} / $MAX_HISTORY_CHARS chars"
         else
           print -- "History: disabled"
         fi
         continue
         ;;
 
-      "/memory")
+      /memory)
         if (( USE_MEMORY )); then
-          print -- "Memory: enabled"
-          print -- "Memory file: $MEMORY_FILE"
-
+          print -- "File   : $MEMORY_FILE"
           if [[ -r "$MEMORY_FILE" ]]; then
-            print -- "Status: readable"
-            print -- "Characters: $(wc -m < "$MEMORY_FILE" | tr -d ' ')"
+            print -- "Status : loaded (${#MEMORY_CONTEXT} chars)"
           else
-            print -- "Status: not found or not readable"
+            print -- "Status : not found or not readable"
           fi
         else
           print -- "Memory: disabled"
@@ -366,21 +273,15 @@ run_interactive_chat() {
         continue
         ;;
 
-      "/multiline")
-        read_multiline_prompt
-        user_input="$REPLY"
-
-        if [[ -z "$user_input" ]]; then
-          continue
-        fi
+      /multiline)
+        read_multiline
+        input="$REPLY"
+        [[ -z "$input" ]] && continue
         ;;
     esac
 
-    print -- ""
-    print -- "Aeon>"
-    if ! ask_model "$user_input"; then
-      print -ru2 -- "Error: model request failed."
-    fi
+    printf "\nAeon>\n"
+    ask_model "$input" || print -ru2 -- "Request failed."
     print -- ""
   done
 }
@@ -390,59 +291,26 @@ run_interactive_chat() {
 ###############################################################################
 
 ONE_SHOT=0
-POSITIONAL=()
+typeset -ga POSITIONAL
 
-while (( $# > 0 )); do
+while (( $# )); do
   case "$1" in
     -m|--model)
-      shift
-      [[ $# -gt 0 ]] || die "Missing model name after --model"
+      shift; [[ $# -gt 0 ]] || die "Missing value for --model"
       MODEL="$1"
       ;;
-
-    --no-history)
-      USE_HISTORY=0
-      ;;
-
+    --no-history)  USE_HISTORY=0 ;;
     --memory-file)
-      shift
-      [[ $# -gt 0 ]] || die "Missing file path after --memory-file"
+      shift; [[ $# -gt 0 ]] || die "Missing value for --memory-file"
       MEMORY_FILE="$1"
       ;;
-
-    --no-memory)
-      USE_MEMORY=0
-      ;;
-
-    -1|--one-shot)
-      ONE_SHOT=1
-      ;;
-
-    -h|--help)
-      usage
-      exit 0
-      ;;
-
-  
-
-    --)
-      shift
-      while (( $# > 0 )); do
-        POSITIONAL+=("$1")
-        shift
-      done
-      break
-      ;;
-
-    -*)
-      die "Unknown option: $1"
-      ;;
-
-    *)
-      POSITIONAL+=("$1")
-      ;;
+    --no-memory)   USE_MEMORY=0 ;;
+    -1|--one-shot) ONE_SHOT=1 ;;
+    -h|--help)     usage; exit 0 ;;
+    --)            shift; POSITIONAL+=("$@"); break ;;
+    -*)            die "Unknown option: $1" ;;
+    *)             POSITIONAL+=("$1") ;;
   esac
-
   shift
 done
 
@@ -450,25 +318,16 @@ done
 # Main
 ###############################################################################
 
-ensure_ollama_available
-ensure_model_available
+ensure_deps
+ensure_model
+load_memory
 
-if (( ${#POSITIONAL} > 0 )); then
-  ONE_SHOT=1
-fi
+(( ${#POSITIONAL} )) && ONE_SHOT=1
 
 if (( ONE_SHOT )); then
-  if (( ${#POSITIONAL} == 0 )); then
-    die "One-shot mode requires a prompt."
-  fi
-
-  USER_PROMPT="${(j: :)POSITIONAL}"
-
-  if ! ask_model "$USER_PROMPT"; then
-    die "Model request failed."
-  fi
-
+  (( ${#POSITIONAL} )) || die "One-shot mode requires a prompt."
+  ask_model "${(j: :)POSITIONAL}" || die "Request failed."
   exit 0
 fi
 
-run_interactive_chat
+run_chat
