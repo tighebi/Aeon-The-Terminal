@@ -98,6 +98,19 @@ ensure_model() {
   fi
 }
 
+warmup_model() {
+  printf "Loading..." >&2
+
+  jq -n --arg model "$MODEL" \
+    '{model: $model, messages: [{role: "user", content: ""}], stream: false, keep_alive: "30m"}' |
+    curl -sf \
+      -H 'Content-Type: application/json' \
+      --data-binary @- \
+      "${OLLAMA_HOST}/api/chat" >/dev/null 2>&1
+
+  printf "\r\033[K" >&2   # clear the loading line
+}
+
 load_memory() {
   MEMORY_CONTEXT=""
   (( USE_MEMORY )) && [[ -r "$MEMORY_FILE" ]] && MEMORY_CONTEXT="$(<"$MEMORY_FILE")"
@@ -320,6 +333,7 @@ done
 
 ensure_deps
 ensure_model
+warmup_model
 load_memory
 
 (( ${#POSITIONAL} )) && ONE_SHOT=1
